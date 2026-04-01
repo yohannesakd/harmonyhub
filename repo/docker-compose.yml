@@ -1,0 +1,94 @@
+name: harmonyhub
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-harmonyhub}
+      POSTGRES_USER: ${POSTGRES_USER:-harmonyhub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-harmonyhub_dev}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-harmonyhub} -d ${POSTGRES_DB:-harmonyhub}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./apps/api
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://harmonyhub:harmonyhub_dev@db:5432/harmonyhub}
+      HH_ENVIRONMENT: ${HH_ENVIRONMENT:-development}
+      HH_API_PREFIX: ${HH_API_PREFIX:-/api/v1}
+      HH_LOG_LEVEL: ${HH_LOG_LEVEL:-INFO}
+      HH_JWT_SECRET: ${HH_JWT_SECRET:-change-me-in-real-deployments}
+      HH_DATA_ENCRYPTION_KEY: ${HH_DATA_ENCRYPTION_KEY:-dev-only-data-encryption-key}
+      HH_JWT_EXPIRE_MINUTES: ${HH_JWT_EXPIRE_MINUTES:-480}
+      HH_PICKUP_CODE_TTL_SECONDS: ${HH_PICKUP_CODE_TTL_SECONDS:-300}
+      HH_COOKIE_SECURE: ${HH_COOKIE_SECURE:-true}
+      HH_RATE_LIMIT_USER_PER_MIN: ${HH_RATE_LIMIT_USER_PER_MIN:-60}
+      HH_RATE_LIMIT_IP_PER_MIN: ${HH_RATE_LIMIT_IP_PER_MIN:-300}
+      HH_BOOTSTRAP_ADMIN_USERNAME: ${HH_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      HH_BOOTSTRAP_ADMIN_PASSWORD: ${HH_BOOTSTRAP_ADMIN_PASSWORD:-admin123!}
+      HH_EXPORT_DIR: ${HH_EXPORT_DIR:-/backup/exports}
+      HH_BACKUP_DIR: ${HH_BACKUP_DIR:-/backup/runs}
+      HH_BACKUP_OFFLINE_MEDIUM_DIR: ${HH_BACKUP_OFFLINE_MEDIUM_DIR:-/backup/offline-medium}
+      HH_BACKUP_NIGHTLY_ENABLED: ${HH_BACKUP_NIGHTLY_ENABLED:-true}
+      HH_BACKUP_NIGHTLY_HOUR_UTC: ${HH_BACKUP_NIGHTLY_HOUR_UTC:-2}
+      HH_AUDIT_RETENTION_DAYS: ${HH_AUDIT_RETENTION_DAYS:-365}
+      HH_RECOVERY_DRILL_INTERVAL_DAYS: ${HH_RECOVERY_DRILL_INTERVAL_DAYS:-90}
+      HH_TRUSTED_PROXY_CIDRS: ${HH_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - backup_runs:${HH_BACKUP_DIR:-/backup/runs}
+      - backup_medium:${HH_BACKUP_OFFLINE_MEDIUM_DIR:-/backup/offline-medium}
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+
+  worker:
+    build:
+      context: ./apps/worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://harmonyhub:harmonyhub_dev@db:5432/harmonyhub}
+      HH_LOG_LEVEL: ${HH_LOG_LEVEL:-INFO}
+      HH_OFFLINE_BACKUP_MEDIUM_PATH: ${HH_OFFLINE_BACKUP_MEDIUM_PATH:-/backup/offline-medium}
+      HH_WORKER_HEARTBEAT_SECONDS: ${HH_WORKER_HEARTBEAT_SECONDS:-30}
+      HH_WORKER_BACKUP_CHECK_SECONDS: ${HH_WORKER_BACKUP_CHECK_SECONDS:-300}
+      HH_WORKER_OPERATIONS_CHECK_SECONDS: ${HH_WORKER_OPERATIONS_CHECK_SECONDS:-3600}
+      HH_AUDIT_RETENTION_DAYS: ${HH_AUDIT_RETENTION_DAYS:-365}
+      HH_RECOVERY_DRILL_INTERVAL_DAYS: ${HH_RECOVERY_DRILL_INTERVAL_DAYS:-90}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - backup_medium:${HH_OFFLINE_BACKUP_MEDIUM_PATH:-/backup/offline-medium}
+
+  web:
+    build:
+      context: ./apps/web
+    environment:
+      HH_WEB_API_PROXY_TARGET: http://api:8000
+    ports:
+      - "5173:5173"
+
+  proxy:
+    build:
+      context: ./infra/proxy
+    environment:
+      HH_CERT_CN: ${HH_CERT_CN:-localhost}
+    depends_on:
+      - api
+      - web
+    ports:
+      - "9080:80"
+      - "9443:443"
+    volumes:
+      - ./infra/proxy/certs:/etc/nginx/certs
+
+volumes:
+  db_data:
+  backup_medium:
+  backup_runs:

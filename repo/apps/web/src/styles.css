@@ -1,0 +1,68 @@
+:root {
+  --font-body: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', 'Helvetica Neue', Arial, sans-serif;
+  --font-heading: ui-serif, Georgia, Cambria, 'Times New Roman', Times, serif;
+  --focus-ring-color: #5c1f82;
+  --focus-ring-shadow: rgba(92, 31, 130, 0.2);
+  font-family: var(--font-body);
+  color: #17253a;
+  background:
+    radial-gradient(circle at 10% 5%, rgba(131, 90, 214, 0.15), transparent 28%),
+    radial-gradient(circle at 85% 15%, rgba(50, 139, 199, 0.18), transparent 25%),
+    linear-gradient(180deg, #edf2f7, #f7f4ec 80%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100%;
+}
+
+a {
+  color: inherit;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: var(--font-heading);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[role='button']:focus-visible,
+[tabindex]:not([tabindex='-1']):focus-visible {
+  outline: 3px solid var(--focus-ring-color);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px var(--focus-ring-shadow);
+}
+
+a:focus:not(:focus-visible),
+button:focus:not(:focus-visible),
+input:focus:not(:focus-visible),
+select:focus:not(:focus-visible),
+textarea:focus:not(:focus-visible),
+summary:focus:not(:focus-visible),
+[role='button']:focus:not(:focus-visible),
+[tabindex]:not([tabindex='-1']):focus:not(:focus-visible) {
+  outline: none;
+  box-shadow: none;
+}
