@@ -1,0 +1,20 @@
+# docker-compose.verify.yml
+#
+# Compose override for verify_runtime_routes.sh ONLY.
+# DO NOT use with ordinary docker compose up --build.
+#
+# What it adds versus the base compose file:
+#   api:
+#     - HH_DEMO_SEED_ON_STARTUP=true  so seeded credentials are available for smoke requests
+#     - HH_ROUTE_COVERAGE_FILE        so every API request is logged to a JSONL file
+#     - volume mount ./apps/api/coverage:/app/coverage  so the JSONL file is host-visible
+#
+# The base runtime contract (docker compose up --build) is unchanged by this file.
+
+services:
+  api:
+    environment:
+      HH_DEMO_SEED_ON_STARTUP: "true"
+      HH_ROUTE_COVERAGE_FILE: /app/coverage/route_hits.jsonl
+    volumes:
+      - ./apps/api/coverage:/app/coverage

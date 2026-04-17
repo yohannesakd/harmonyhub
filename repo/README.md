@@ -247,31 +247,39 @@ Notes:
   - Test output (screenshots/traces/videos): `test-results/`
   - Checkpoint screenshots: `screenshots/`
 
-### API route coverage inventory artifact
+### Optional runtime/proxy smoke verification (supplementary, not the canonical gate)
 
-Generate a concrete route-to-test coverage artifact from real endpoint hits during API pytest:
+`verify_runtime_routes.sh` is a Docker-only helper that brings up the full compose stack via
+`docker-compose.verify.yml` (an overlay that enables demo-seed and route-hit logging), issues
+real HTTP requests through the live TLS proxy (`https://localhost:9443`), then generates a
+host-visible route-hit inventory. No host toolchain beyond Docker and curl is required.
 
 ```bash
-docker compose up -d db
-docker compose exec -T db psql -U "${POSTGRES_USER:-harmonyhub}" -d postgres -v ON_ERROR_STOP=1 \
-  -c 'DROP DATABASE IF EXISTS "harmonyhub_test";' \
-  -c 'CREATE DATABASE "harmonyhub_test";'
-
-docker compose build api
-docker compose run --rm --no-deps \
-  -e DATABASE_URL=postgresql+psycopg2://harmonyhub:harmonyhub_dev@db:5432/harmonyhub_test \
-  -e HH_TEST_POSTGRES_DATABASE_URL=postgresql+psycopg2://harmonyhub:harmonyhub_dev@db:5432/harmonyhub_test \
-  -e HH_COOKIE_SECURE=false \
-  -e HH_BACKUP_NIGHTLY_ENABLED=false \
-  -e HH_ROUTE_COVERAGE_FILE=/tmp/route_hits.jsonl \
-  -v "$PWD/apps/api:/workspace" \
-  api sh -lc "pytest -q && python /workspace/scripts/generate_route_coverage_report.py --hits-file /tmp/route_hits.jsonl --output-json /workspace/coverage/api-route-coverage.json --output-md /workspace/coverage/api-route-coverage.md"
+./verify_runtime_routes.sh
 ```
 
-Generated artifacts are written to:
+What it does:
 
-- `apps/api/coverage/api-route-coverage.json`
-- `apps/api/coverage/api-route-coverage.md`
+1. Brings up all five compose services with the verify overlay (`db`, `api`, `worker`, `web`, `proxy`).
+2. Waits for the live API to confirm readiness at `/health/ready`.
+3. Sends a representative set of GET and POST requests through the Nginx TLS proxy using seeded
+   demo credentials — real HTTP traffic through the full live stack.
+4. The running API writes every request to `apps/api/coverage/route_hits.jsonl` on the host
+   via the `HH_ROUTE_COVERAGE_FILE` middleware.
+5. Generates a structured summary using the report generator (Python inside the container).
+6. Tears down the verify stack and removes the session cookie file.
+
+Generated artifacts in `apps/api/coverage/`:
+
+- `route_hits.jsonl` — raw per-request log from the live API middleware
+- `runtime-smoke-coverage.json` — structured route-hit inventory
+- `runtime-smoke-coverage.md` — human-readable summary
+
+**Coverage scope:** artifacts are from real HTTP through the live uvicorn process and Nginx TLS
+proxy. They cover a representative cross-section, not all 82 endpoints. They are supplementary
+runtime smoke evidence, not a replacement for `./run_tests.sh`.
+
+**Prerequisite:** the stack must not be running when this script is invoked (`docker compose down` first).
 
 ## Configuration
 
