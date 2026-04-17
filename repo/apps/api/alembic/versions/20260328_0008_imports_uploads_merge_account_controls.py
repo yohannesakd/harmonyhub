@@ -18,13 +18,19 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
     op.add_column("users", sa.Column("frozen_at", sa.DateTime(timezone=True), nullable=True))
     op.add_column("users", sa.Column("freeze_reason", sa.String(length=255), nullable=True))
     op.add_column("users", sa.Column("frozen_by_user_id", sa.String(length=36), nullable=True))
     op.add_column("users", sa.Column("unfrozen_at", sa.DateTime(timezone=True), nullable=True))
     op.add_column("users", sa.Column("unfrozen_by_user_id", sa.String(length=36), nullable=True))
-    op.create_foreign_key("fk_users_frozen_by_user_id", "users", "users", ["frozen_by_user_id"], ["id"])
-    op.create_foreign_key("fk_users_unfrozen_by_user_id", "users", "users", ["unfrozen_by_user_id"], ["id"])
+    if bind.dialect.name == "sqlite":
+        with op.batch_alter_table("users") as batch:
+            batch.create_foreign_key("fk_users_frozen_by_user_id", "users", ["frozen_by_user_id"], ["id"])
+            batch.create_foreign_key("fk_users_unfrozen_by_user_id", "users", ["unfrozen_by_user_id"], ["id"])
+    else:
+        op.create_foreign_key("fk_users_frozen_by_user_id", "users", "users", ["frozen_by_user_id"], ["id"])
+        op.create_foreign_key("fk_users_unfrozen_by_user_id", "users", "users", ["unfrozen_by_user_id"], ["id"])
 
     op.create_table(
         "uploaded_assets",
@@ -177,8 +183,14 @@ def downgrade() -> None:
     op.drop_index("ix_uploaded_assets_organization_id", table_name="uploaded_assets")
     op.drop_table("uploaded_assets")
 
-    op.drop_constraint("fk_users_unfrozen_by_user_id", "users", type_="foreignkey")
-    op.drop_constraint("fk_users_frozen_by_user_id", "users", type_="foreignkey")
+    bind = op.get_bind()
+    if bind.dialect.name == "sqlite":
+        with op.batch_alter_table("users") as batch:
+            batch.drop_constraint("fk_users_unfrozen_by_user_id", type_="foreignkey")
+            batch.drop_constraint("fk_users_frozen_by_user_id", type_="foreignkey")
+    else:
+        op.drop_constraint("fk_users_unfrozen_by_user_id", "users", type_="foreignkey")
+        op.drop_constraint("fk_users_frozen_by_user_id", "users", type_="foreignkey")
     op.drop_column("users", "unfrozen_by_user_id")
     op.drop_column("users", "unfrozen_at")
     op.drop_column("users", "frozen_by_user_id")

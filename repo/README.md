@@ -1,5 +1,7 @@
 # HarmonyHub (Auth + Discovery + Ordering/Scheduling + Fulfillment/Handoff + Imports/Account Controls + Offline Sync/Conflict UX + Operations Accountability)
 
+**Project type: fullstack** (Vue 3 SPA + FastAPI REST API + PostgreSQL + background worker, all containerised under Docker Compose)
+
 HarmonyHub is a multi-tenant web platform for performing arts operations and event concessions.
 
 This repository currently contains:
@@ -27,10 +29,9 @@ repo/
   infra/
     proxy/    # Nginx TLS proxy + self-signed cert bootstrap
   docker-compose.yml
+  init_db.sh
   run_tests.sh
 ```
-
-Submission-facing documentation is packaged at the project root under `../docs/`.
 
 ## Implemented capabilities (current)
 
@@ -48,6 +49,7 @@ Submission-facing documentation is packaged at the project root under `../docs/`
   - popularity over 30 days
   - recent activity over 72 hours
   - tag matching
+  - runtime search impressions from `/directory/search` and `/repertoire/search` are persisted as recommendation signals
 - Recommendation config APIs with scope inheritance/override (`organization -> program -> event/store`)
 - Featured pin management APIs (pin/unpin/list)
 - Pairing rule APIs (allowlist/blocklist/list/delete), with blocklist precedence
@@ -62,18 +64,21 @@ Submission-facing documentation is packaged at the project root under `../docs/`
 - Secure upload endpoint with extension+MIME+magic-byte checks and 25MB cap
 - CSV import batch pipeline for member/roster data with raw-row preservation
 - Duplicate candidate queue with merge/ignore and safe undo behavior
-- Account freeze/unfreeze APIs with reason tracking + audit events and protected-route enforcement
+- Membership-scoped account freeze/unfreeze APIs with reason tracking + audit events and protected-route enforcement
 - Operations accountability APIs:
   - audit event query with scoped filters
   - enforced 12-month audit retention cleanup (startup + worker compliance job)
-  - directory CSV export generation/list/download with scope + masking boundaries
+  - directory CSV export generation/list/download with scope + ABAC row/field parity against directory surfaces, requester-scoped run visibility/download
+  - export CSV artifacts are encrypted at rest on disk and decrypted only for authorized download responses
   - backup run trigger/list with checksums + optional offline-medium copy verification
+  - backup JSON artifacts (including offline-medium copies) are encrypted at rest on disk and decrypted only during checksum-verified restore/recovery paths
   - backup artifacts are restore-capable tenant logical snapshots over critical scoped tables
   - recovery drill create/list linked to backup runs, with PostgreSQL-schema restore verification (SQLite fallback in local/test) + table-count checks
   - operations status summary endpoint with quarterly drill compliance (`current|overdue`) and retention telemetry
 - PostgreSQL storage architecture alignment:
   - flexible document columns use PostgreSQL `JSONB` in canonical runtime
   - SQLite test/local path keeps JSON compatibility
+  - sensitive import-normalization payloads (`raw_row_json`, `normalized_json`) are persisted as encrypted JSON envelopes inside the flexible document columns (not plaintext JSON)
   - `recommendation_signals` is range-partitioned by `occurred_at` in PostgreSQL migrations
   - high-volume recommendation signal indexes explicitly cover `repertoire_item_id + occurred_at` and `user_id + occurred_at`
 - Offline web foundation:
@@ -128,7 +133,7 @@ Submission-facing documentation is packaged at the project root under `../docs/`
   - per-item sync indicators on address and order rows
   - queued confirm conflict surfacing with server-provided conflict reasons and suggested slot context
 
-### Seed baseline users
+### Seed baseline users (optional startup demo seed)
 
 - `admin` / `admin123!`
 - `staff` / `staff123!`
@@ -137,8 +142,22 @@ Submission-facing documentation is packaged at the project root under `../docs/`
 
 `admin` has administrator memberships across multiple contexts; other users are role-specific.
 
-These seeded credentials are for local/demo runtime only. For non-development environments,
-override at least `HH_JWT_SECRET`, `HH_DATA_ENCRYPTION_KEY`, and `HH_BOOTSTRAP_ADMIN_PASSWORD`.
+Startup seeding is disabled by default. To opt into demo seeding on API startup for local development,
+set `HH_DEMO_SEED_ON_STARTUP=true` in a development/test environment.
+
+For non-development environments, startup demo seeding is intentionally skipped even when
+`HH_DEMO_SEED_ON_STARTUP=true`. Also override at least `HH_JWT_SECRET`, `HH_DATA_ENCRYPTION_KEY`, and
+`HH_BOOTSTRAP_ADMIN_PASSWORD`.
+
+## Quick reference
+
+| What | Where |
+|---|---|
+| **Start the app** | `docker compose up --build` |
+| **Access the app** | `https://localhost:9443` (self-signed TLS) |
+| **API base** | `https://localhost:9443/api/v1` |
+| **Run all tests** | `./run_tests.sh` |
+| **Demo login** | `admin` / `admin123!` (see credentials below) |
 
 ## Runtime (canonical)
 
@@ -147,6 +166,8 @@ The project uses Docker Compose as the runtime contract.
 ```bash
 docker compose up --build
 ```
+
+Legacy CLI compatibility: `docker-compose up --build` works identically on installations that use the older hyphenated Docker Compose v1 syntax.
 
 Compose project name is pinned to `harmonyhub` in `docker-compose.yml`.
 
@@ -158,12 +179,38 @@ Services started:
 - `web` (Vite production preview server)
 - `proxy` (TLS ingress)
 
+The `api` service automatically runs `alembic upgrade head` on startup, so no separate database initialisation step is required for ordinary startup.
+
 ### Access points
 
-- App (HTTPS): `https://localhost:9443`
+- App (HTTPS): `https://localhost:9443` ← **primary access point**
 - HTTP redirect: `http://localhost:9080`
 - API base via proxy: `https://localhost:9443/api/v1`
-- Direct web preview (optional): `http://localhost:5173`
+- Direct web preview (Vite dev server, optional): `http://localhost:5173`
+
+## Database setup (optional maintenance / CI helper)
+
+`./init_db.sh` is **not required for ordinary startup**. `docker compose up --build` handles database initialisation automatically via the `api` service's Alembic startup step.
+
+Use `./init_db.sh` when you need to pre-create or reset the application and test databases outside of a full compose startup — for example, before running `./run_tests.sh` on a fresh machine where the `harmonyhub_test` database does not yet exist.
+
+```bash
+./init_db.sh
+```
+
+What it does:
+
+- starts `db` with Docker Compose
+- ensures the application database exists (default: `harmonyhub`)
+- ensures the API test database exists (default: `harmonyhub_test`)
+- builds the `api` image and runs `alembic upgrade head` against the application database
+
+Optional knobs:
+
+- `HH_INIT_DB_INCLUDE_TEST_DB=false` to skip creating the test database
+- `HH_INIT_DB_MIGRATE_TEST_DB=true` to also run Alembic migrations on the test database
+- `HH_APP_DB_NAME`, `HH_API_TEST_DB_NAME` to override database names
+- `HH_INIT_DB_DATABASE_URL`, `HH_INIT_DB_TEST_DATABASE_URL` to override migration URLs
 
 ## Testing (canonical)
 
@@ -177,9 +224,14 @@ This script builds the service images and runs:
 - Worker pytest suite
 - Web Vitest suite
 
-### Integrated browser verification (Playwright)
+API tests also include migration-path verification (`test_startup_seed_and_migrations.py`) that runs
+`alembic upgrade head` and asserts key schema contracts to catch ORM-vs-migration drift.
 
-From `apps/web`:
+### Browser E2E verification (Playwright — optional, separate from `./run_tests.sh`)
+
+Playwright E2E tests are **not** part of the canonical `./run_tests.sh` gate. They require the full compose runtime to be running and a host-installed browser. They are supplementary verification only.
+
+From `apps/web` (with the compose stack already up):
 
 ```bash
 npm run test:e2e
@@ -190,7 +242,7 @@ Notes:
 - Browser E2E runs against the compose runtime (default web base `http://127.0.0.1:5173`).
 - API-side setup used by E2E helpers targets `https://localhost:9443` by default.
 - To override API helper target, set `E2E_API_BASE_URL`.
-- Artifacts are written to `apps/web/e2e-artifacts/`:
+- Generated artifacts are written to `apps/web/e2e-artifacts/` when the command is run:
   - HTML report: `playwright-report/`
   - Test output (screenshots/traces/videos): `test-results/`
   - Checkpoint screenshots: `screenshots/`
@@ -216,18 +268,15 @@ docker compose run --rm --no-deps \
   api sh -lc "pytest -q && python /workspace/scripts/generate_route_coverage_report.py --hits-file /tmp/route_hits.jsonl --output-json /workspace/coverage/api-route-coverage.json --output-md /workspace/coverage/api-route-coverage.md"
 ```
 
-Artifacts are written to:
+Generated artifacts are written to:
 
 - `apps/api/coverage/api-route-coverage.json`
 - `apps/api/coverage/api-route-coverage.md`
 
 ## Configuration
 
-Copy defaults if needed:
-
-```bash
-cp .env.example .env
-```
+No `.env` file is required or shipped in the repo. For local overrides, pass environment variables through
+your shell, Docker Compose overrides, or one-shot command prefixes.
 
 Important env vars:
 
@@ -241,6 +290,7 @@ Important env vars:
 - `HH_COOKIE_SECURE`
 - `HH_BOOTSTRAP_ADMIN_USERNAME`
 - `HH_BOOTSTRAP_ADMIN_PASSWORD`
+- `HH_DEMO_SEED_ON_STARTUP`
 - `HH_EXPORT_DIR`
 - `HH_BACKUP_DIR`
 - `HH_BACKUP_OFFLINE_MEDIUM_DIR`

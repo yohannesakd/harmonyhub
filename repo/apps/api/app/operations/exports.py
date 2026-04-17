@@ -10,15 +10,23 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.authz.abac import get_policy_evaluator
 from app.core.config import get_settings
-from app.core.masking import mask_address, mask_email, mask_phone
+from app.core.field_encryption import encrypt_bytes
+from app.directory.access import (
+    build_directory_subject,
+    is_directory_row_allowed,
+    serialize_directory_contact_with_field_scope,
+)
 from app.db.models import (
     DirectoryEntry,
     DirectoryEntryRepertoireItem,
+    Membership,
     DirectoryEntryTag,
     ExportRun,
     RepertoireItem,
     Tag,
+    User,
 )
 
 
@@ -51,17 +59,34 @@ def _csv_text_for_directory_rows(rows: list[dict[str, str]]) -> str:
     return out.getvalue()
 
 
-def _build_export_rows(db: Session, *, organization_id: str, program_id: str, event_id: str, store_id: str, include_sensitive: bool) -> list[dict[str, str]]:
+def _build_export_rows(
+    db: Session,
+    *,
+    membership: Membership,
+    requested_by_user: User,
+    include_sensitive: bool,
+) -> list[dict[str, str]]:
     entries = db.scalars(
         select(DirectoryEntry)
         .where(
-            DirectoryEntry.organization_id == organization_id,
-            DirectoryEntry.program_id == program_id,
-            DirectoryEntry.event_id == event_id,
-            DirectoryEntry.store_id == store_id,
+            DirectoryEntry.organization_id == membership.organization_id,
+            DirectoryEntry.program_id == membership.program_id,
+            DirectoryEntry.event_id == membership.event_id,
+            DirectoryEntry.store_id == membership.store_id,
         )
         .order_by(DirectoryEntry.display_name.asc())
     ).all()
+
+    row_action = "reveal_row" if include_sensitive else "search_row"
+    subject = build_directory_subject(requested_by_user)
+    row_evaluator = get_policy_evaluator(db, membership, surface="directory", action=row_action)
+    field_evaluator = get_policy_evaluator(db, membership, surface="directory", action="contact_field_view")
+    entries = [
+        entry
+        for entry in entries
+        if is_directory_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry)
+    ]
+
     if not entries:
         return []
 
@@ -92,9 +117,15 @@ def _build_export_rows(db: Session, *, organization_id: str, program_id: str, ev
 
     export_rows: list[dict[str, str]] = []
     for entry in entries:
-        email = entry.email if include_sensitive else mask_email(entry.email)
-        phone = entry.phone if include_sensitive else mask_phone(entry.phone)
-        address_line1 = entry.address_line1 if include_sensitive else mask_address(entry.address_line1)
+        contact = serialize_directory_contact_with_field_scope(
+            db,
+            membership=membership,
+            user=requested_by_user,
+            entry=entry,
+            masked=not include_sensitive,
+            subject=subject,
+            field_evaluator=field_evaluator,
+        )
         export_rows.append(
             {
                 "entry_id": entry.id,
@@ -103,9 +134,9 @@ def _build_export_rows(db: Session, *, organization_id: str, program_id: str, ev
                 "region": entry.region,
                 "tags": ", ".join(sorted(set(tags_by_entry.get(entry.id, [])))),
                 "repertoire_titles": ", ".join(sorted(set(reps_by_entry.get(entry.id, [])))),
-                "email": email or "",
-                "phone": phone or "",
-                "address_line1": address_line1 or "",
+                "email": contact.email or "",
+                "phone": contact.phone or "",
+                "address_line1": contact.address_line1 or "",
                 "biography": entry.biography or "",
             }
         )
@@ -115,10 +146,8 @@ def _build_export_rows(db: Session, *, organization_id: str, program_id: str, ev
 def create_directory_export(
     db: Session,
     *,
-    organization_id: str,
-    program_id: str,
-    event_id: str,
-    store_id: str,
+    membership: Membership,
+    requested_by_user: User,
     requested_by_user_id: str,
     include_sensitive: bool,
 ) -> DirectoryExportResult:
@@ -128,28 +157,27 @@ def create_directory_export(
 
     rows = _build_export_rows(
         db,
-        organization_id=organization_id,
-        program_id=program_id,
-        event_id=event_id,
-        store_id=store_id,
+        membership=membership,
+        requested_by_user=requested_by_user,
         include_sensitive=include_sensitive,
     )
     csv_text = _csv_text_for_directory_rows(rows)
     csv_bytes = csv_text.encode("utf-8")
     digest = hashlib.sha256(csv_bytes).hexdigest()
+    encrypted_csv_bytes = encrypt_bytes(csv_bytes)
 
     filename = (
-        f"directory_export_{organization_id[:8]}_{program_id[:8]}_{event_id[:8]}_{store_id[:8]}_"
+        f"directory_export_{membership.organization_id[:8]}_{membership.program_id[:8]}_{membership.event_id[:8]}_{membership.store_id[:8]}_"
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.csv"
     )
     file_path = export_dir / filename
-    file_path.write_bytes(csv_bytes)
+    file_path.write_bytes(encrypted_csv_bytes)
 
     export_run = ExportRun(
-        organization_id=organization_id,
-        program_id=program_id,
-        event_id=event_id,
-        store_id=store_id,
+        organization_id=membership.organization_id,
+        program_id=membership.program_id,
+        event_id=membership.event_id,
+        store_id=membership.store_id,
         requested_by_user_id=requested_by_user_id,
         export_type="directory.csv",
         status="completed",
@@ -157,7 +185,7 @@ def create_directory_export(
         filters_json=None,
         row_count=len(rows),
         file_path=str(file_path),
-        file_size_bytes=len(csv_bytes),
+        file_size_bytes=len(encrypted_csv_bytes),
         sha256=digest,
         created_at=datetime.now(UTC),
         completed_at=datetime.now(UTC),

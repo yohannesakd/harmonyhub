@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,7 @@ from app.api.deps import AuthorizedMembership, authorize_for_active_context, ver
 from app.authz.rbac import Permission
 from app.core.config import get_settings
 from app.core.errors import AppError
+from app.core.field_encryption import decrypt_bytes
 from app.db.models import BackupRun, ExportRun, ImportBatch, ImportDuplicateCandidate, Order, RecoveryDrillRun
 from app.db.session import get_db_session
 from app.operations.audit import list_audit_events_for_scope, record_membership_audit_event, sanitize_audit_details
@@ -47,6 +48,10 @@ def _assert_path_within_directory(path: Path, allowed_root: Path) -> None:
         resolved_path.relative_to(resolved_root)
     except ValueError as exc:
         raise AppError(code="VALIDATION_ERROR", message="Export artifact path is invalid", status_code=404) from exc
+
+
+def _sha256_hex(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def _serialize_backup(run: BackupRun) -> BackupRunResponse:
@@ -155,10 +160,8 @@ def export_directory_csv(
     membership = authorized.membership
     result = create_directory_export(
         db,
-        organization_id=membership.organization_id,
-        program_id=membership.program_id,
-        event_id=membership.event_id,
-        store_id=membership.store_id,
+        membership=membership,
+        requested_by_user=authorized.principal.user,
         requested_by_user_id=authorized.principal.user.id,
         include_sensitive=payload.include_sensitive,
     )
@@ -198,6 +201,7 @@ def list_export_runs(
             ExportRun.program_id == membership.program_id,
             ExportRun.event_id == membership.event_id,
             ExportRun.store_id == membership.store_id,
+            ExportRun.requested_by_user_id == authorized.principal.user.id,
         )
         .order_by(ExportRun.created_at.desc())
     ).all()
@@ -211,7 +215,7 @@ def download_export_run(
         authorize_for_active_context(Permission.EXPORT_MANAGE, surface="operations", action="export_download")
     ),
     db: Session = Depends(get_db_session),
-) -> FileResponse:
+) -> Response:
     membership = authorized.membership
     run = db.scalar(
         select(ExportRun).where(
@@ -220,6 +224,7 @@ def download_export_run(
             ExportRun.program_id == membership.program_id,
             ExportRun.event_id == membership.event_id,
             ExportRun.store_id == membership.store_id,
+            ExportRun.requested_by_user_id == authorized.principal.user.id,
         )
     )
     if not run:
@@ -230,6 +235,13 @@ def download_export_run(
     if not file_path.exists():
         raise AppError(code="VALIDATION_ERROR", message="Export artifact not found on disk", status_code=404)
 
+    try:
+        decrypted_bytes = decrypt_bytes(file_path.read_bytes())
+    except ValueError as exc:
+        raise AppError(code="VALIDATION_ERROR", message="Export artifact could not be decrypted", status_code=422) from exc
+    if _sha256_hex(decrypted_bytes) != run.sha256:
+        raise AppError(code="VALIDATION_ERROR", message="Export artifact checksum verification failed", status_code=422)
+
     record_membership_audit_event(
         db,
         membership,
@@ -239,7 +251,11 @@ def download_export_run(
         details={"sha256": run.sha256},
     )
     db.commit()
-    return FileResponse(path=file_path, filename=file_path.name, media_type="text/csv")
+    return Response(
+        content=decrypted_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'},
+    )
 
 
 @router.post(

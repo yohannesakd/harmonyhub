@@ -69,11 +69,6 @@ class User(Base):
     class_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    freeze_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    frozen_by_user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
-    unfrozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    unfrozen_by_user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
 
@@ -87,6 +82,12 @@ class Membership(Base):
     event_id: Mapped[str] = mapped_column(String(36), ForeignKey("events.id"), nullable=False)
     store_id: Mapped[str] = mapped_column(String(36), ForeignKey("stores.id"), nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_frozen: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    freeze_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    frozen_by_user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
+    unfrozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    unfrozen_by_user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, nullable=False)
 
 

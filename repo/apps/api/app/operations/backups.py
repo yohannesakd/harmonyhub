@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.sqltypes import DateTime as SQLDateTime
 
 from app.core.config import Settings, get_settings
+from app.core.field_encryption import decrypt_bytes, encrypt_bytes
 from app.core.logging import sanitize_exception_for_log
 from app.db.base import Base
 from app.db.models import (
@@ -443,13 +444,15 @@ def run_backup_for_scope(
     payload = _backup_payload_for_scope(db, scope)
     payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     digest = _compute_sha256(payload_bytes)
+    encrypted_payload_bytes = encrypt_bytes(payload_bytes)
+    encrypted_digest = _compute_sha256(encrypted_payload_bytes)
 
     filename = (
         f"backup_{scope.organization_id[:8]}_{scope.program_id[:8]}_{scope.event_id[:8]}_{scope.store_id[:8]}_"
         f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
     )
     file_path = backup_dir / filename
-    file_path.write_bytes(payload_bytes)
+    file_path.write_bytes(encrypted_payload_bytes)
 
     offline_copy_path: str | None = None
     offline_verified = False
@@ -459,7 +462,7 @@ def run_backup_for_scope(
         copied_file_path = offline_dir / filename
         shutil.copyfile(file_path, copied_file_path)
         copied_digest = _compute_sha256(copied_file_path.read_bytes())
-        offline_verified = copied_digest == digest
+        offline_verified = copied_digest == encrypted_digest
         offline_copy_path = str(copied_file_path)
 
     table_counts = payload["verification"]["table_counts"]
@@ -482,7 +485,7 @@ def run_backup_for_scope(
         trigger_type=trigger_type,
         status="completed",
         file_path=str(file_path),
-        file_size_bytes=len(payload_bytes),
+        file_size_bytes=len(encrypted_payload_bytes),
         sha256=digest,
         offline_copy_path=offline_copy_path,
         offline_copy_verified=offline_verified,
@@ -555,7 +558,12 @@ def _load_and_verify_backup_payload(backup_run: BackupRun) -> dict:
     if not artifact_path.exists():
         raise ValueError("Backup artifact file does not exist")
 
-    bytes_payload = artifact_path.read_bytes()
+    encrypted_payload = artifact_path.read_bytes()
+    try:
+        bytes_payload = decrypt_bytes(encrypted_payload)
+    except ValueError as exc:
+        raise ValueError("Backup artifact decryption failed") from exc
+
     digest = _compute_sha256(bytes_payload)
     if digest != backup_run.sha256:
         raise ValueError("Backup checksum verification failed")

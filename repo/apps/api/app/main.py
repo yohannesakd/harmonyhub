@@ -35,9 +35,17 @@ def current_utc_time() -> datetime:
 async def lifespan(_: FastAPI):
     engine = get_engine()
     with Session(engine) as session:
-        seed_baseline_data(session)
+        settings = get_settings()
+        if settings.demo_seed_on_startup:
+            if settings.is_development_environment:
+                seed_baseline_data(session)
+                logger.info("Demo baseline data seeded at startup")
+            else:
+                logger.warning(
+                    "Startup demo seeding requested but skipped outside development/test environments",
+                    extra={"environment": settings.environment},
+                )
         try:
-            settings = get_settings()
             pruned_events = prune_audit_events_for_retention(session, retention_days=settings.audit_retention_days)
             overdue_scopes = count_overdue_recovery_drill_scopes(
                 session,

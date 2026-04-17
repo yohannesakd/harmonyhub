@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db.models import DirectoryEntry, RepertoireItem
+from app.db.session import get_engine
+
 
 def _iso_now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -74,6 +80,109 @@ def test_recommendation_scoring_uses_tag_match_and_weights(client):
     assert by_name_after["Ava Martinez"]["score"]["total"] > by_name_after["Ben Carter"]["score"]["total"]
     assert by_name_after["Ava Martinez"]["score"]["popularity_30d"] == 0
     assert by_name_after["Ava Martinez"]["score"]["recent_activity_72h"] == 0
+
+
+def test_runtime_directory_search_signals_increase_recommendation_scores(client):
+    with Session(get_engine()) as session:
+        scope_seed = session.scalar(select(DirectoryEntry).where(DirectoryEntry.display_name == "Ava Martinez"))
+        assert scope_seed is not None
+        boosted = DirectoryEntry(
+            organization_id=scope_seed.organization_id,
+            program_id=scope_seed.program_id,
+            event_id=scope_seed.event_id,
+            store_id=scope_seed.store_id,
+            display_name="Zulu Runtime Boosted",
+            stage_name=None,
+            region=scope_seed.region,
+            email="zulu.runtime.boosted@harmonyhub.example",
+            phone="555-111-9898",
+            address_line1="901 Runtime Lane",
+            biography="runtime ranking proof target",
+        )
+        control = DirectoryEntry(
+            organization_id=scope_seed.organization_id,
+            program_id=scope_seed.program_id,
+            event_id=scope_seed.event_id,
+            store_id=scope_seed.store_id,
+            display_name="Alpha Runtime Control",
+            stage_name=None,
+            region=scope_seed.region,
+            email="alpha.runtime.control@harmonyhub.example",
+            phone="555-111-9797",
+            address_line1="902 Runtime Lane",
+            biography="runtime ranking proof control",
+        )
+        session.add_all([boosted, control])
+        session.commit()
+
+    _login(client, "student", "stud123!")
+
+    before = client.get("/api/v1/recommendations/directory")
+    assert before.status_code == 200
+    before_names = [item["display_name"] for item in before.json()["results"]]
+    assert before_names.index("Zulu Runtime Boosted") > before_names.index("Alpha Runtime Control")
+    before_scores = {item["display_name"]: item["score"] for item in before.json()["results"]}
+
+    search = client.get("/api/v1/directory/search", params={"actor": "Zulu Runtime Boosted"})
+    assert search.status_code == 200
+    assert [item["display_name"] for item in search.json()["results"]] == ["Zulu Runtime Boosted"]
+
+    after = client.get("/api/v1/recommendations/directory")
+    assert after.status_code == 200
+    after_names = [item["display_name"] for item in after.json()["results"]]
+    assert after_names.index("Zulu Runtime Boosted") < after_names.index("Alpha Runtime Control")
+    after_scores = {item["display_name"]: item["score"] for item in after.json()["results"]}
+
+    assert after_scores["Zulu Runtime Boosted"]["popularity_30d"] > before_scores["Zulu Runtime Boosted"]["popularity_30d"]
+    assert (
+        after_scores["Zulu Runtime Boosted"]["recent_activity_72h"]
+        > before_scores["Zulu Runtime Boosted"]["recent_activity_72h"]
+    )
+
+
+def test_runtime_repertoire_search_signals_increase_recommendation_scores(client):
+    with Session(get_engine()) as session:
+        scope_seed = session.scalar(select(RepertoireItem).where(RepertoireItem.title == "Moonlight Sonata"))
+        assert scope_seed is not None
+        boosted = RepertoireItem(
+            organization_id=scope_seed.organization_id,
+            program_id=scope_seed.program_id,
+            event_id=scope_seed.event_id,
+            store_id=scope_seed.store_id,
+            title="Zulu Runtime Piece",
+            composer="Runtime Composer",
+        )
+        control = RepertoireItem(
+            organization_id=scope_seed.organization_id,
+            program_id=scope_seed.program_id,
+            event_id=scope_seed.event_id,
+            store_id=scope_seed.store_id,
+            title="Alpha Runtime Piece",
+            composer="Runtime Composer",
+        )
+        session.add_all([boosted, control])
+        session.commit()
+
+    _login(client, "student", "stud123!")
+
+    before = client.get("/api/v1/recommendations/repertoire")
+    assert before.status_code == 200
+    before_titles = [item["title"] for item in before.json()["results"]]
+    assert before_titles.index("Zulu Runtime Piece") > before_titles.index("Alpha Runtime Piece")
+    before_scores = {item["title"]: item["score"] for item in before.json()["results"]}
+
+    search = client.get("/api/v1/repertoire/search", params={"q": "Zulu Runtime Piece"})
+    assert search.status_code == 200
+    assert [item["title"] for item in search.json()["results"]] == ["Zulu Runtime Piece"]
+
+    after = client.get("/api/v1/recommendations/repertoire")
+    assert after.status_code == 200
+    after_titles = [item["title"] for item in after.json()["results"]]
+    assert after_titles.index("Zulu Runtime Piece") < after_titles.index("Alpha Runtime Piece")
+    after_scores = {item["title"]: item["score"] for item in after.json()["results"]}
+
+    assert after_scores["Zulu Runtime Piece"]["popularity_30d"] > before_scores["Zulu Runtime Piece"]["popularity_30d"]
+    assert after_scores["Zulu Runtime Piece"]["recent_activity_72h"] > before_scores["Zulu Runtime Piece"]["recent_activity_72h"]
 
 
 def test_config_inheritance_and_staff_delegation_boundary(client):

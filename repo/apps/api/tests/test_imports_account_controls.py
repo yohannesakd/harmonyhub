@@ -399,6 +399,66 @@ def test_account_controls_are_scoped_to_active_context(client):
         assert unfreeze_outsider.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
+def test_freeze_is_membership_scoped_and_does_not_disable_other_contexts():
+    with TestClient(create_app()) as admin_client:
+        admin_csrf = _login(admin_client, "admin", "admin123!")
+
+        with TestClient(create_app()) as staff_client:
+            staff_first_login = staff_client.post(
+                "/api/v1/auth/login",
+                json={"username": "staff", "password": "staff123!"},
+            )
+            assert staff_first_login.status_code == 200
+            frozen_context = staff_first_login.json()["active_context"]
+            assert frozen_context is not None
+
+        users = admin_client.get("/api/v1/accounts/users")
+        assert users.status_code == 200
+        staff_user = next(user for user in users.json() if user["username"] == "staff")
+
+        frozen = admin_client.post(
+            f"/api/v1/accounts/users/{staff_user['id']}/freeze",
+            headers=_headers(admin_csrf, nonce="freeze-staff-context-a"),
+            json={"reason": "Context-only hold"},
+        )
+        assert frozen.status_code == 200
+        assert frozen.json()["is_frozen"] is True
+
+    with TestClient(create_app()) as staff_client:
+        login_again = staff_client.post(
+            "/api/v1/auth/login",
+            json={"username": "staff", "password": "staff123!"},
+        )
+        assert login_again.status_code == 200
+        active_context = login_again.json()["active_context"]
+        assert active_context is not None
+        assert (
+            active_context["organization_id"],
+            active_context["program_id"],
+            active_context["event_id"],
+            active_context["store_id"],
+        ) != (
+            frozen_context["organization_id"],
+            frozen_context["program_id"],
+            frozen_context["event_id"],
+            frozen_context["store_id"],
+        )
+
+        csrf = login_again.json()["csrf_token"]
+        switch_to_frozen = staff_client.post(
+            "/api/v1/contexts/active",
+            headers=_headers(csrf, nonce="switch-to-frozen-context"),
+            json={
+                "organization_id": frozen_context["organization_id"],
+                "program_id": frozen_context["program_id"],
+                "event_id": frozen_context["event_id"],
+                "store_id": frozen_context["store_id"],
+            },
+        )
+        assert switch_to_frozen.status_code == 423
+        assert switch_to_frozen.json()["error"]["code"] == "ACCOUNT_FROZEN"
+
+
 def test_import_listing_detail_and_duplicate_ignore_path(client):
     staff_csrf = _login(client, "staff", "staff123!")
 

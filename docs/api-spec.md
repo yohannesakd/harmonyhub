@@ -1,7 +1,7 @@
 # HarmonyHub API Specification (Implemented)
 
 Status: reflects implemented backend routes  
-Last updated: 2026-03-30
+Last updated: 2026-04-07
 
 Base path: `/api/v1`
 
@@ -60,6 +60,12 @@ The API stores the following high-risk fields encrypted at rest:
 - `directory_entries.email`, `directory_entries.phone`, `directory_entries.address_line1`
 - `address_book_entries.recipient_name`, `line1`, `line2`, `phone`
 - `uploaded_assets.raw_bytes`
+- `import_normalized_rows.raw_row_json` and `normalized_json` via encrypted JSON envelope payloads
+
+Operational artifacts are also encrypted at rest on disk before persistence:
+
+- directory export CSV artifacts
+- tenant backup artifacts and offline-copy artifacts
 
 Encryption is transparent to API consumers (request/response payloads are unchanged).
 
@@ -124,6 +130,8 @@ Behavior:
 - validates credentials
 - lockout enforced (`ACCOUNT_LOCKED`, 423)
 - if user MFA enabled and no/invalid TOTP provided -> `MFA_REQUIRED` / `MFA_INVALID`
+- if all memberships available to the user are frozen, login returns `ACCOUNT_FROZEN` (423)
+- otherwise login selects the first unfrozen membership as the active context
 - sets session + CSRF cookies
 - returns user summary + active context + active-context permissions
 
@@ -134,7 +142,7 @@ Returns:
 - user summary
 - active context
 - active-context permissions
-- `available_contexts`
+- `available_contexts` (unfrozen memberships only)
 
 ### `POST /auth/logout`
 
@@ -172,6 +180,7 @@ Body:
 Behavior:
 
 - validates membership for scope
+- selecting a frozen membership returns `423 ACCOUNT_FROZEN`
 - RBAC check `context.switch`
 - ABAC check (`surface=context`, `action=switch`)
 - rotates session token with updated active context
@@ -612,7 +621,9 @@ Scope behavior:
 
 Freeze behavior:
 
-- frozen users are blocked from protected usage and login with `423 ACCOUNT_FROZEN`
+- freeze/unfreeze state is stored on the scoped `memberships` row, not the global `users` row
+- a frozen active context returns `423 ACCOUNT_FROZEN`
+- login succeeds if the user still has at least one unfrozen membership and fails with `423 ACCOUNT_FROZEN` only when all memberships are frozen
 - freeze/unfreeze actions persist `audit_events` entries with operator reason details
 
 ---
@@ -640,19 +651,21 @@ Freeze behavior:
   - `include_sensitive=true` additionally requires `directory.contact.reveal`
   - export rows remain scoped to active context
   - masked contact values are used when `include_sensitive=false`
-  - creates `export_runs` record with checksum + metadata
+  - creates requester-scoped `export_runs` record with plaintext checksum + metadata
+  - export artifact bytes are encrypted at rest on disk
   - writes audit event `exports.directory.generated`
 - `GET /operations/exports/runs`
 - `GET /operations/exports/runs/{export_run_id}/download`
-  - scoped by active context
+  - scoped by active context and requesting user
+  - decrypts artifact bytes only for the authorized download response after checksum verification
   - writes audit event `exports.directory.downloaded`
 
 ### 14.3 Backup and recovery APIs
 
 - `POST /operations/backups/run` (CSRF + replay required)
   - permission: `backup.manage`
-  - creates restore-capable tenant logical backup artifact JSON from critical scoped tables, computes SHA-256, persists `backup_runs`
-  - optional offline-medium copy verification with checksum comparison
+  - creates restore-capable tenant logical backup artifact JSON from critical scoped tables, computes SHA-256 over plaintext payload, then persists encrypted artifact bytes
+  - optional offline-medium copy verification compares encrypted artifact copy bytes while restore/recovery paths decrypt and verify plaintext checksum before load
   - writes audit event `backup.run.completed`
 - `GET /operations/backups/runs`
   - permission: `operations.view`

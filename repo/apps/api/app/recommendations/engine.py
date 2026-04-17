@@ -383,3 +383,90 @@ def verify_repertoire_item_in_scope(db: Session, membership: Membership, item_id
     if not item:
         raise AppError(code="VALIDATION_ERROR", message="Repertoire item is out of scope", status_code=404)
     return item
+
+
+def _record_runtime_signals(
+    db: Session,
+    membership: Membership,
+    *,
+    user_id: str,
+    surface: str,
+    directory_entry_ids: list[str] | None,
+    repertoire_item_ids: list[str] | None,
+    signal_type: str,
+    weight: float,
+) -> None:
+    now = datetime.now(UTC)
+    for entry_id in directory_entry_ids or []:
+        db.add(
+            RecommendationSignal(
+                organization_id=membership.organization_id,
+                program_id=membership.program_id,
+                event_id=membership.event_id,
+                store_id=membership.store_id,
+                surface=surface,
+                user_id=user_id,
+                directory_entry_id=entry_id,
+                repertoire_item_id=None,
+                signal_type=signal_type,
+                weight=weight,
+                occurred_at=now,
+                created_at=now,
+            )
+        )
+
+    for item_id in repertoire_item_ids or []:
+        db.add(
+            RecommendationSignal(
+                organization_id=membership.organization_id,
+                program_id=membership.program_id,
+                event_id=membership.event_id,
+                store_id=membership.store_id,
+                surface=surface,
+                user_id=user_id,
+                directory_entry_id=None,
+                repertoire_item_id=item_id,
+                signal_type=signal_type,
+                weight=weight,
+                occurred_at=now,
+                created_at=now,
+            )
+        )
+
+
+def record_directory_search_impressions(
+    db: Session,
+    membership: Membership,
+    *,
+    user_id: str,
+    directory_entry_ids: list[str],
+) -> None:
+    _record_runtime_signals(
+        db,
+        membership,
+        user_id=user_id,
+        surface="directory",
+        directory_entry_ids=directory_entry_ids,
+        repertoire_item_ids=None,
+        signal_type="search_impression",
+        weight=1.0,
+    )
+
+
+def record_repertoire_search_impressions(
+    db: Session,
+    membership: Membership,
+    *,
+    user_id: str,
+    repertoire_item_ids: list[str],
+) -> None:
+    _record_runtime_signals(
+        db,
+        membership,
+        user_id=user_id,
+        surface="repertoire",
+        directory_entry_ids=None,
+        repertoire_item_ids=repertoire_item_ids,
+        signal_type="search_impression",
+        weight=1.0,
+    )

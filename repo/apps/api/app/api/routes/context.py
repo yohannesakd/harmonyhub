@@ -31,7 +31,11 @@ def available_contexts(
     db: Session = Depends(get_db_session),
 ) -> list[ContextChoice]:
     memberships = get_user_memberships(principal, db)
-    allowed = [membership for membership in memberships if Permission.CONTEXT_LIST in get_permissions_for_role(membership.role)]
+    allowed = [
+        membership
+        for membership in memberships
+        if (Permission.CONTEXT_LIST in get_permissions_for_role(membership.role)) and not membership.is_frozen
+    ]
     if not allowed:
         raise AppError(code="FORBIDDEN", message="Permission denied by RBAC", status_code=403)
     return memberships_to_context_choices(allowed, db)
@@ -55,6 +59,17 @@ def set_active_context(
     )
     if not membership:
         raise AppError(code="FORBIDDEN", message="Context not available for user", status_code=403)
+
+    if membership.is_frozen:
+        details: dict[str, str] = {}
+        if membership.frozen_at:
+            details["frozen_at"] = membership.frozen_at.isoformat()
+        raise AppError(
+            code="ACCOUNT_FROZEN",
+            message="Account is frozen for this active context",
+            status_code=423,
+            details=details,
+        )
 
     if Permission.CONTEXT_SWITCH not in get_permissions_for_role(membership.role):
         raise AppError(code="FORBIDDEN", message="Permission denied by RBAC", status_code=403)

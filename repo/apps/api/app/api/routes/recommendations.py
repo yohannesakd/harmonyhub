@@ -8,9 +8,14 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import AuthorizedMembership, authorize_for_active_context, verify_csrf, verify_replay_headers
+from app.authz.abac import get_policy_evaluator
 from app.authz.rbac import Permission
 from app.core.errors import AppError
-from app.core.masking import mask_address, mask_email, mask_phone
+from app.directory.access import (
+    build_directory_subject,
+    is_directory_row_allowed,
+    serialize_directory_contact_with_field_scope,
+)
 from app.db.models import (
     DirectoryEntry,
     DirectoryEntryRepertoireItem,
@@ -39,7 +44,6 @@ from app.recommendations.engine import (
     verify_directory_entry_in_scope,
     verify_repertoire_item_in_scope,
 )
-from app.schemas.directory import ContactResponse
 from app.schemas.recommendations import (
     DirectoryRecommendationItem,
     DirectoryRecommendationsResponse,
@@ -105,17 +109,6 @@ def _effective_config_to_response(
         allow_staff_event_store_manage=effective.allow_staff_event_store_manage,
         updated_at=updated_at,
     )
-
-
-def _serialize_contact(entry: DirectoryEntry, *, masked: bool) -> ContactResponse:
-    if masked:
-        return ContactResponse(
-            email=mask_email(entry.email),
-            phone=mask_phone(entry.phone),
-            address_line1=mask_address(entry.address_line1),
-            masked=True,
-        )
-    return ContactResponse(email=entry.email, phone=entry.phone, address_line1=entry.address_line1, masked=False)
 
 
 def _score(
@@ -360,6 +353,9 @@ def recommend_directory(
 ) -> DirectoryRecommendationsResponse:
     membership = authorized.membership
     effective = resolve_effective_config(db, membership)
+    subject = build_directory_subject(authorized.principal.user)
+    row_evaluator = get_policy_evaluator(db, membership, surface="directory", action="search_row")
+    field_evaluator = get_policy_evaluator(db, membership, surface="directory", action="contact_field_view")
 
     if repertoire_item_id:
         verify_repertoire_item_in_scope(db, membership, repertoire_item_id)
@@ -372,6 +368,9 @@ def recommend_directory(
             DirectoryEntry.store_id == membership.store_id,
         )
     ).all()
+    entries = [
+        entry for entry in entries if is_directory_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry)
+    ]
 
     entry_ids = [entry.id for entry in entries]
     if not entry_ids:
@@ -421,7 +420,15 @@ def recommend_directory(
             region=entry.region,
             tags=sorted(entry_tags.get(entry.id, set())),
             repertoire=repertoire_map.get(entry.id, []),
-            contact=_serialize_contact(entry, masked=True),
+            contact=serialize_directory_contact_with_field_scope(
+                db,
+                membership=membership,
+                user=authorized.principal.user,
+                entry=entry,
+                masked=True,
+                subject=subject,
+                field_evaluator=field_evaluator,
+            ),
             pinned=is_pinned,
             score=score,
         )
@@ -450,9 +457,13 @@ def recommend_repertoire(
 ) -> RepertoireRecommendationsResponse:
     membership = authorized.membership
     effective = resolve_effective_config(db, membership)
+    subject = build_directory_subject(authorized.principal.user)
+    row_evaluator = get_policy_evaluator(db, membership, surface="directory", action="search_row")
 
     if directory_entry_id:
-        verify_directory_entry_in_scope(db, membership, directory_entry_id)
+        selected_entry = verify_directory_entry_in_scope(db, membership, directory_entry_id)
+        if not is_directory_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=selected_entry):
+            raise AppError(code="VALIDATION_ERROR", message="Directory entry is out of scope", status_code=404)
 
     items = db.scalars(
         select(RepertoireItem).where(
@@ -472,13 +483,20 @@ def recommend_repertoire(
 
     performer_map: dict[str, list[str]] = defaultdict(list)
     performer_rows = db.execute(
-        select(DirectoryEntryRepertoireItem.repertoire_item_id, DirectoryEntry.display_name)
+        select(DirectoryEntryRepertoireItem.repertoire_item_id, DirectoryEntry)
         .join(DirectoryEntry, DirectoryEntry.id == DirectoryEntryRepertoireItem.directory_entry_id)
-        .where(DirectoryEntryRepertoireItem.repertoire_item_id.in_(item_ids))
+        .where(
+            DirectoryEntryRepertoireItem.repertoire_item_id.in_(item_ids),
+            DirectoryEntry.organization_id == membership.organization_id,
+            DirectoryEntry.program_id == membership.program_id,
+            DirectoryEntry.event_id == membership.event_id,
+            DirectoryEntry.store_id == membership.store_id,
+        )
         .order_by(DirectoryEntry.display_name.asc())
     ).all()
-    for item_id, performer_name in performer_rows:
-        performer_map[item_id].append(performer_name)
+    for item_id, performer_entry in performer_rows:
+        if is_directory_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=performer_entry):
+            performer_map[item_id].append(performer_entry.display_name)
 
     pin_rows = get_active_pins(db, membership, "repertoire") if effective.pins_enabled else []
     active_pinned_ids = [pin.repertoire_item_id for pin in pin_rows if pin.repertoire_item_id][: effective.max_pins]

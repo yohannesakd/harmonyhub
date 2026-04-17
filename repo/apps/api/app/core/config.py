@@ -28,6 +28,7 @@ class Settings(BaseSettings):
 
     bootstrap_admin_username: str = Field(default="admin", alias="HH_BOOTSTRAP_ADMIN_USERNAME")
     bootstrap_admin_password: str = Field(default="admin123!", alias="HH_BOOTSTRAP_ADMIN_PASSWORD")
+    demo_seed_on_startup: bool = Field(default=False, alias="HH_DEMO_SEED_ON_STARTUP")
 
     export_dir: str = Field(default="/tmp/harmonyhub_exports", alias="HH_EXPORT_DIR")
     backup_dir: str = Field(default="/tmp/harmonyhub_backups", alias="HH_BACKUP_DIR")
@@ -41,10 +42,13 @@ class Settings(BaseSettings):
     rate_limit_ip_per_min: int = Field(default=300, ge=1, alias="HH_RATE_LIMIT_IP_PER_MIN")
     data_encryption_key: str = Field(default="dev-only-data-encryption-key", alias="HH_DATA_ENCRYPTION_KEY")
 
+    @property
+    def is_development_environment(self) -> bool:
+        return self.environment.lower().strip() in {"development", "dev", "test", "testing", "local"}
+
     @model_validator(mode="after")
     def validate_non_development_security_defaults(self) -> "Settings":
-        environment = self.environment.lower().strip()
-        if environment in {"development", "dev", "test", "testing", "local"}:
+        if self.is_development_environment:
             return self
 
         weak_jwt_defaults = {"change-me", "change-me-in-real-deployments", "test-secret"}

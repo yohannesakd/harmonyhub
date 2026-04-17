@@ -20,7 +20,11 @@ from app.main import create_app  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(request: pytest.FixtureRequest):
+    if request.node.name == "test_alembic_upgrade_head_contains_membership_freeze_schema":
+        yield
+        return
+
     get_settings.cache_clear()
     get_field_fernet.cache_clear()
     reset_engine_for_tests()

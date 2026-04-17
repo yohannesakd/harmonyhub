@@ -142,20 +142,6 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
         raise AppError(code="AUTH_REQUIRED", message="Invalid credentials", status_code=401)
 
     if not user.is_active:
-        if user.frozen_at:
-            _record_auth_audit(
-                db,
-                user,
-                action="auth.login.frozen_blocked",
-                details={"reason": user.freeze_reason, "frozen_at": user.frozen_at.isoformat() if user.frozen_at else None},
-            )
-            db.commit()
-            raise AppError(
-                code="ACCOUNT_FROZEN",
-                message="Account is frozen",
-                status_code=423,
-                details={"frozen_at": user.frozen_at.isoformat()},
-            )
         raise AppError(code="AUTH_REQUIRED", message="Invalid credentials", status_code=401)
 
     now = datetime.now(UTC)
@@ -204,7 +190,27 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
     db.commit()
 
     memberships = db.scalars(select(Membership).where(Membership.user_id == user.id).order_by(Membership.created_at.asc())).all()
-    active_membership = memberships[0] if memberships else None
+    unfrozen_memberships = [membership for membership in memberships if not membership.is_frozen]
+    if memberships and not unfrozen_memberships:
+        blocked = memberships[0]
+        _record_auth_audit(
+            db,
+            user,
+            action="auth.login.frozen_blocked",
+            details={
+                "reason": blocked.freeze_reason,
+                "frozen_at": blocked.frozen_at.isoformat() if blocked.frozen_at else None,
+            },
+        )
+        db.commit()
+        raise AppError(
+            code="ACCOUNT_FROZEN",
+            message="Account is frozen for all available contexts",
+            status_code=423,
+            details={"frozen_at": blocked.frozen_at.isoformat()} if blocked.frozen_at else {},
+        )
+
+    active_membership = unfrozen_memberships[0] if unfrozen_memberships else None
     active_context = _active_context_from_membership(active_membership)
     permissions = sorted(get_permissions_for_role(active_membership.role if active_membership else ""))
 
@@ -238,11 +244,25 @@ def me(
     db: Session = Depends(get_db_session),
 ) -> MeResponse:
     memberships = get_user_memberships(principal, db)
-    contexts = memberships_to_context_choices(memberships, db)
+    available_memberships = [membership for membership in memberships if not membership.is_frozen]
+    contexts = memberships_to_context_choices(available_memberships, db)
 
     active_context = principal.active_context
-    if not active_context and memberships:
-        active_context = _active_context_from_membership(memberships[0])
+    if active_context:
+        active_membership = db.scalar(
+            select(Membership).where(
+                Membership.user_id == principal.user.id,
+                Membership.organization_id == active_context.organization_id,
+                Membership.program_id == active_context.program_id,
+                Membership.event_id == active_context.event_id,
+                Membership.store_id == active_context.store_id,
+                Membership.role == active_context.role,
+            )
+        )
+        if active_membership and active_membership.is_frozen:
+            active_context = None
+    if not active_context and available_memberships:
+        active_context = _active_context_from_membership(available_memberships[0])
 
     active_permissions: list[str] = []
     if active_context:

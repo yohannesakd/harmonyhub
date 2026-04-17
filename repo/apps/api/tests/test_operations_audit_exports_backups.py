@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from fastapi.testclient import TestClient
 
 from app.core.config import get_settings
+from app.core.field_encryption import decrypt_bytes
 from app.db.base import Base
 from app.db.models import AuditEvent, ExportRun, Membership, RecoveryDrillRun, User
 from app.db.init_data import seed_baseline_data
@@ -74,6 +75,16 @@ def test_directory_export_masks_sensitive_fields_and_records_audit(client):
     run_rows = runs.json()
     assert any(row["id"] == run_id for row in run_rows)
 
+    with Session(get_engine()) as session:
+        run = session.scalar(select(ExportRun).where(ExportRun.id == run_id))
+        assert run is not None
+        encrypted_artifact = Path(run.file_path).read_bytes()
+        assert encrypted_artifact.startswith(b"enc::")
+        assert b"display_name" not in encrypted_artifact
+
+        decrypted_artifact = decrypt_bytes(encrypted_artifact).decode("utf-8")
+        assert "display_name" in decrypted_artifact
+
     downloaded = client.get(payload["download_path"])
     assert downloaded.status_code == 200
     csv_text = downloaded.content.decode("utf-8")
@@ -124,6 +135,26 @@ def test_export_download_rejects_artifact_outside_export_directory(client, tmp_p
     assert downloaded.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
+def test_export_runs_are_requester_scoped_for_listing_and_download(client):
+    staff_csrf = _login(client, "staff", "staff123!")
+    export = client.post(
+        "/api/v1/operations/exports/directory-csv",
+        headers=_headers(staff_csrf, nonce="staff-export-requester-scope"),
+        json={"include_sensitive": False},
+    )
+    assert export.status_code == 200
+    run_id = export.json()["export_run"]["id"]
+
+    _login(client, "admin", "admin123!")
+    listed = client.get("/api/v1/operations/exports/runs")
+    assert listed.status_code == 200
+    assert all(row["id"] != run_id for row in listed.json())
+
+    downloaded = client.get(f"/api/v1/operations/exports/runs/{run_id}/download")
+    assert downloaded.status_code == 404
+    assert downloaded.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
 def test_backups_recovery_drills_and_operations_status(client):
     staff_csrf = _login(client, "staff", "staff123!")
 
@@ -146,12 +177,23 @@ def test_backups_recovery_drills_and_operations_status(client):
 
     backup_file = Path(backup_payload["file_path"])
     assert backup_file.exists()
-    backup_artifact = json.loads(backup_file.read_text(encoding="utf-8"))
+    encrypted_backup_artifact = backup_file.read_bytes()
+    assert encrypted_backup_artifact.startswith(b"enc::")
+    assert b'"backup_kind"' not in encrypted_backup_artifact
+
+    backup_artifact = json.loads(decrypt_bytes(encrypted_backup_artifact).decode("utf-8"))
     assert backup_artifact["backup_kind"] == "tenant_logical_full"
     assert backup_artifact["backup_format_version"] == 2
     assert "tables" in backup_artifact
     for table_name in ["orders", "order_items", "memberships", "menu_items", "import_batches", "audit_events"]:
         assert table_name in backup_artifact["tables"]
+
+    assert backup_payload["offline_copy_path"]
+    offline_copy_artifact = Path(backup_payload["offline_copy_path"])
+    assert offline_copy_artifact.exists()
+    encrypted_offline_copy = offline_copy_artifact.read_bytes()
+    assert encrypted_offline_copy.startswith(b"enc::")
+    assert decrypt_bytes(encrypted_offline_copy) == decrypt_bytes(encrypted_backup_artifact)
 
     listed_backups = client.get("/api/v1/operations/backups/runs")
     assert listed_backups.status_code == 200

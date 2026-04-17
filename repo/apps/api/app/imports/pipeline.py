@@ -19,6 +19,7 @@ from app.db.models import (
     RepertoireItem,
     UploadedAsset,
 )
+from app.imports.sensitive_json import protect_import_json_payload, reveal_import_json_payload
 
 UNRESOLVED_DUPLICATE_STATUSES = {"open", "undo_applied"}
 
@@ -189,8 +190,8 @@ def normalize_import_batch(db: Session, membership: Membership, batch: ImportBat
         normalized_row = ImportNormalizedRow(
             batch_id=batch.id,
             row_number=row_number,
-            raw_row_json=row,
-            normalized_json=normalized if is_valid else None,
+            raw_row_json=protect_import_json_payload(row),
+            normalized_json=protect_import_json_payload(normalized) if is_valid else None,
             issues_json={"issues": issues} if issues else None,
             is_valid=is_valid,
             processing_status=processing_status,
@@ -341,7 +342,8 @@ def apply_import_batch(db: Session, membership: Membership, batch: ImportBatch) 
         if row.processing_status in {"applied", "merged", "ignored"}:
             processed_count += 1
             continue
-        if not row.is_valid or not row.normalized_json:
+        normalized = reveal_import_json_payload(row.normalized_json)
+        if not row.is_valid or not normalized:
             continue
 
         duplicates = db.scalars(
@@ -358,7 +360,6 @@ def apply_import_batch(db: Session, membership: Membership, batch: ImportBatch) 
             processed_count += 1
             continue
 
-        normalized = row.normalized_json
         if batch.kind == "member":
             entry = DirectoryEntry(
                 organization_id=membership.organization_id,
@@ -484,7 +485,9 @@ def merge_duplicate_candidate(
     if not row or not row.normalized_json or not target:
         raise AppError(code="VALIDATION_ERROR", message="Duplicate candidate dependencies are missing", status_code=422)
 
-    normalized = row.normalized_json
+    normalized = reveal_import_json_payload(row.normalized_json)
+    if not normalized:
+        raise AppError(code="VALIDATION_ERROR", message="Duplicate candidate dependencies are missing", status_code=422)
     updatable_fields = ["stage_name", "email", "phone", "address_line1", "biography", "region"]
     before_fields: dict[str, str | None] = {}
     applied_fields: dict[str, str] = {}

@@ -131,16 +131,26 @@ def get_session_principal(
         raise AppError(code="AUTH_REQUIRED", message="User inactive", status_code=401)
 
     if not user.is_active:
-        if user.frozen_at:
-            raise AppError(
-                code="ACCOUNT_FROZEN",
-                message="Account is frozen",
-                status_code=423,
-                details={"frozen_at": user.frozen_at.isoformat()},
-            )
         raise AppError(code="AUTH_REQUIRED", message="User inactive", status_code=401)
 
     return SessionPrincipal(user=user, session_payload=payload, active_context=_extract_active_context(payload))
+
+
+def _raise_account_frozen(membership: Membership) -> None:
+    details: dict[str, str] = {}
+    if membership.frozen_at:
+        details["frozen_at"] = membership.frozen_at.isoformat()
+    raise AppError(
+        code="ACCOUNT_FROZEN",
+        message="Account is frozen for this active context",
+        status_code=423,
+        details=details,
+    )
+
+
+def _ensure_membership_not_frozen(membership: Membership) -> None:
+    if membership.is_frozen:
+        _raise_account_frozen(membership)
 
 
 def _resolve_membership_from_active_context(principal: SessionPrincipal, db: Session) -> Membership | None:
@@ -175,13 +185,18 @@ def get_user_memberships(principal: SessionPrincipal, db: Session) -> list[Membe
 def get_active_membership(principal: SessionPrincipal, db: Session) -> Membership:
     membership = _resolve_membership_from_active_context(principal, db)
     if membership:
+        _ensure_membership_not_frozen(membership)
         return membership
 
     memberships = get_user_memberships(principal, db)
     if not memberships:
         raise AppError(code="FORBIDDEN", message="No memberships available", status_code=403)
 
-    return memberships[0]
+    for fallback in memberships:
+        if not fallback.is_frozen:
+            return fallback
+
+    _raise_account_frozen(memberships[0])
 
 
 def memberships_to_context_choices(memberships: list[Membership], db: Session) -> list[ContextChoice]:

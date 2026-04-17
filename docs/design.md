@@ -1,7 +1,7 @@
 # HarmonyHub Technical Design
 
 Status: implemented runtime baseline + auth/context/authz + directory/repertoire + recommendations/pairing + ordering/scheduling + fulfillment/handoff + imports/account-controls + offline sync/conflict UX + operations accountability  
-Last updated: 2026-03-30
+Last updated: 2026-04-07
 
 ---
 
@@ -51,9 +51,10 @@ Implemented vertical slices:
 8. Imports + account-controls core module:
    - secure upload validation (extension + MIME + magic-byte, 25 MB cap, SHA-256)
    - import-batch pipeline with raw-row preservation + normalize/apply phases
+   - raw-row and normalized import JSON persisted as encrypted envelopes inside flexible document columns
    - duplicate candidate queue for member imports with merge/ignore decisions
    - merge undo with safe-undo guard when merged fields were subsequently edited
-   - user freeze/unfreeze actions with reason tracking, audit persistence, and active-context membership scoping
+   - membership-scoped freeze/unfreeze actions with reason tracking, audit persistence, and active-context membership scoping
 
 9. Offline sync + conflict UX module:
    - service-worker powered shell/read caching for non-sensitive ordering reads
@@ -64,8 +65,8 @@ Implemented vertical slices:
 
 10. Operations accountability module:
     - `operations` API surface for audit queries, exports, backups, recovery-drill records, and status summaries
-    - export runs persisted with checksum, row count, and downloadable artifact path
-    - backup runs persisted with checksum, restore-capable tenant logical artifact metadata, and optional offline-medium copy validation
+    - export runs persisted with checksum, row count, requester scope, and encrypted-at-rest artifact path
+    - backup runs persisted with checksum, restore-capable tenant logical artifact metadata, encrypted-at-rest artifact storage, and optional offline-medium copy validation
     - recovery drills execute isolated restore verification from backup artifacts (PostgreSQL schema restore path in runtime, SQLite fallback in local/test) and persist scenario/status/evidence metadata
     - 12-month audit retention enforcement via startup + worker compliance prune paths
     - quarterly recovery-drill compliance evaluation (`current|overdue`) in operations status payloads
@@ -206,7 +207,7 @@ Search/detail queries are constrained to the active membership scope.
 
 ### 3.7 Imports/account-control tables and fields
 
-- `users`: `frozen_at`, `freeze_reason`, `frozen_by_user_id`, `unfrozen_at`, `unfrozen_by_user_id`
+- `memberships`: `is_frozen`, `frozen_at`, `freeze_reason`, `frozen_by_user_id`, `unfrozen_at`, `unfrozen_by_user_id`
 - `uploaded_assets`
 - `import_batches`
 - `import_normalized_rows`
@@ -248,6 +249,7 @@ Client-side persisted stores (localStorage + service-worker cache):
   - `export_runs.filters_json`
   - `backup_runs.verification_json`
   - `recovery_drill_runs.evidence_json`
+- Sensitive import payloads inside `import_normalized_rows.raw_row_json` and `normalized_json` are wrapped as encrypted JSON envelopes before persistence.
 - `recommendation_signals` is the explicit high-volume recommendation event table for storage/index strategy:
   - PostgreSQL range partitioning by `occurred_at`
   - optional `user_id` dimension retained for user-centric signal slicing
@@ -456,6 +458,8 @@ Automated tests include:
 - frontend offline queue component/store behavior
 
 Canonical verification path remains `./run_tests.sh` plus Docker startup checks.
+
+Database setup for delivery packaging is standardized through `repo/init_db.sh`, which creates the app/test databases through Docker Compose and applies Alembic migrations without requiring host Python tooling.
 
 ---
 

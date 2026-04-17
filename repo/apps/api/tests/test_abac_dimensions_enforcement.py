@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -335,3 +337,117 @@ def test_directory_row_and_field_level_abac_enforcement_is_real(client):
     assert contact["email"] is not None
     assert contact["phone"] is not None
     assert contact["address_line1"] is None
+
+
+def test_directory_abac_is_consistent_across_recommendations_and_exports(client):
+    admin_csrf = _login(client, "admin", "admin123!")
+    _upsert_surface(client, admin_csrf, "directory", True)
+
+    with Session(get_engine()) as session:
+        ava = session.scalar(select(DirectoryEntry).where(DirectoryEntry.display_name == "Ava Martinez"))
+        ben = session.scalar(select(DirectoryEntry).where(DirectoryEntry.display_name == "Ben Carter"))
+        chloe = session.scalar(select(DirectoryEntry).where(DirectoryEntry.display_name == "Chloe Ng"))
+        assert ava is not None and ben is not None and chloe is not None
+
+        ava.department = "music"
+        ava.grade_level = "grade_10"
+        ava.class_code = "10A"
+
+        ben.department = "athletics"
+        ben.grade_level = "grade_11"
+        ben.class_code = "11R"
+
+        chloe.department = "music"
+        chloe.grade_level = "grade_10"
+        chloe.class_code = "10B"
+
+        session.add_all([ava, ben, chloe])
+        session.commit()
+
+    _create_rule(
+        client,
+        admin_csrf,
+        {
+            "surface": "directory",
+            "action": "search",
+            "effect": "allow",
+            "priority": 10,
+            "role": "staff",
+            "subject_department": "operations",
+            "subject_grade": "staff",
+            "subject_class": "staff-a",
+        },
+        nonce="dir-cross-surface-search",
+    )
+    _create_rule(
+        client,
+        admin_csrf,
+        {
+            "surface": "directory",
+            "action": "search_row",
+            "effect": "allow",
+            "priority": 10,
+            "role": "staff",
+            "subject_department": "operations",
+            "subject_grade": "staff",
+            "subject_class": "staff-a",
+            "resource_department": "music",
+            "resource_grade": "grade_10",
+            "resource_class": "10A",
+        },
+        nonce="dir-cross-surface-row",
+    )
+    _create_rule(
+        client,
+        admin_csrf,
+        {
+            "surface": "directory",
+            "action": "contact_field_view",
+            "effect": "allow",
+            "priority": 10,
+            "role": "staff",
+            "subject_department": "operations",
+            "subject_grade": "staff",
+            "subject_class": "staff-a",
+            "resource_department": "music",
+            "resource_grade": "grade_10",
+            "resource_class": "10A",
+            "resource_field": "email",
+        },
+        nonce="dir-cross-surface-field-email",
+    )
+
+    staff_csrf = _login(client, "staff", "staff123!")
+
+    directory_results = client.get("/api/v1/directory/search")
+    assert directory_results.status_code == 200
+    assert [row["display_name"] for row in directory_results.json()["results"]] == ["Ava Martinez"]
+
+    recommended_directory = client.get("/api/v1/recommendations/directory")
+    assert recommended_directory.status_code == 200
+    recommendation_payload = recommended_directory.json()["results"]
+    assert [row["display_name"] for row in recommendation_payload] == ["Ava Martinez"]
+    assert recommendation_payload[0]["contact"]["email"] is not None
+    assert recommendation_payload[0]["contact"]["phone"] is None
+    assert recommendation_payload[0]["contact"]["address_line1"] is None
+
+    recommended_repertoire = client.get("/api/v1/recommendations/repertoire")
+    assert recommended_repertoire.status_code == 200
+    for item in recommended_repertoire.json()["results"]:
+        assert "Ben Carter" not in item["performers"]
+        assert "Chloe Ng" not in item["performers"]
+
+    export = client.post(
+        "/api/v1/operations/exports/directory-csv",
+        headers=_headers(staff_csrf, nonce="dir-cross-surface-export"),
+        json={"include_sensitive": False},
+    )
+    assert export.status_code == 200
+
+    downloaded = client.get(export.json()["download_path"])
+    assert downloaded.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(downloaded.content.decode("utf-8"))))
+    assert [row["display_name"] for row in rows] == ["Ava Martinez"]
+    assert rows[0]["email"]
+    assert rows[0]["phone"] == ""
+    assert rows[0]["address_line1"] == ""

@@ -19,6 +19,7 @@ from app.db.models import (
     Tag,
 )
 from app.db.session import get_db_session
+from app.recommendations.engine import record_repertoire_search_impressions
 from app.schemas.repertoire import RepertoireItemCardResponse, RepertoireItemDetailResponse, RepertoireSearchResponse
 
 router = APIRouter(prefix="/repertoire", tags=["repertoire"])
@@ -204,6 +205,15 @@ def search_repertoire(
         )
         for item in items
     ]
+
+    record_repertoire_search_impressions(
+        db,
+        membership,
+        user_id=authorized.principal.user.id,
+        repertoire_item_ids=[item.id for item in items],
+    )
+    db.commit()
+
     return RepertoireSearchResponse(results=results, total=len(results))
 
 

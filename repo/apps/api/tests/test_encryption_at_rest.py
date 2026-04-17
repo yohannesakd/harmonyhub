@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.imports.sensitive_json import ENCRYPTED_IMPORT_JSON_KEY
 from app.db.models import AddressBookEntry, UploadedAsset, User
 from app.db.session import get_engine
 
@@ -124,3 +126,37 @@ def test_uploaded_asset_bytes_are_ciphertext_at_rest_and_import_pipeline_still_r
         headers=_headers(staff_csrf, "normalize-encryption-test"),
     )
     assert normalized.status_code == 200
+
+    with Session(get_engine()) as session:
+        raw_row = session.execute(
+            text(
+                "SELECT raw_row_json, normalized_json "
+                "FROM import_normalized_rows "
+                "WHERE batch_id = :batch_id "
+                "ORDER BY row_number ASC LIMIT 1"
+            ),
+            {"batch_id": batch_id},
+        ).first()
+        assert raw_row is not None
+        stored_raw = raw_row[0]
+        stored_normalized = raw_row[1]
+
+        def _to_dict(value):
+            if isinstance(value, str):
+                return json.loads(value)
+            return value
+
+        raw_json = _to_dict(stored_raw)
+        normalized_json = _to_dict(stored_normalized)
+        assert isinstance(raw_json, dict)
+        assert isinstance(normalized_json, dict)
+        assert ENCRYPTED_IMPORT_JSON_KEY in raw_json
+        assert ENCRYPTED_IMPORT_JSON_KEY in normalized_json
+        assert "Cipher Upload" not in json.dumps(raw_json)
+        assert "cipher@example.com" not in json.dumps(normalized_json)
+
+    detail = client.get(f"/api/v1/imports/batches/{batch_id}")
+    assert detail.status_code == 200
+    first_row = detail.json()["rows"][0]
+    assert first_row["raw_row_json"]["display_name"] == "Cipher Upload"
+    assert first_row["normalized_json"]["display_name"] == "Cipher Upload"

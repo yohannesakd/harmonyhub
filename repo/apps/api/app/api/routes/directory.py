@@ -8,10 +8,14 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import AuthorizedMembership, authorize_for_active_context, verify_csrf, verify_replay_headers
-from app.authz.abac import AbacResourceAttributes, AbacSubjectAttributes, get_policy_evaluator
+from app.authz.abac import get_policy_evaluator
 from app.authz.rbac import Permission
-from app.core.masking import mask_address, mask_email, mask_phone
 from app.core.errors import AppError
+from app.directory.access import (
+    build_directory_subject,
+    is_directory_row_allowed,
+    serialize_directory_contact_with_field_scope,
+)
 from app.db.models import (
     AuditEvent,
     AvailabilityWindow,
@@ -22,9 +26,9 @@ from app.db.models import (
     Tag,
 )
 from app.db.session import get_db_session
+from app.recommendations.engine import record_directory_search_impressions
 from app.schemas.directory import (
     AvailabilityWindowResponse,
-    ContactResponse,
     DirectoryContactRevealResponse,
     DirectoryEntryCardResponse,
     DirectoryEntryDetailResponse,
@@ -115,79 +119,6 @@ def _load_availability_by_entry(db: Session, entry_ids: list[str]) -> dict[str, 
     return availability_map
 
 
-def _directory_resource_attrs(entry: DirectoryEntry) -> AbacResourceAttributes:
-    return AbacResourceAttributes(
-        department=entry.department,
-        grade=entry.grade_level,
-        class_code=entry.class_code,
-    )
-
-
-def _is_row_allowed(
-    *,
-    row_evaluator,
-    subject: AbacSubjectAttributes,
-    entry: DirectoryEntry,
-) -> bool:
-    decision = row_evaluator.evaluate(
-        subject=subject,
-        resource=_directory_resource_attrs(entry),
-        default_allow_if_no_rules=True,
-    )
-    return decision.allowed
-
-
-def _serialize_contact_with_field_scope(
-    db: Session,
-    authorized: AuthorizedMembership,
-    entry: DirectoryEntry,
-    *,
-    masked: bool,
-    subject: AbacSubjectAttributes | None = None,
-    field_evaluator=None,
-) -> ContactResponse:
-    scoped_subject = subject or AbacSubjectAttributes(
-        department=authorized.principal.user.department,
-        grade=authorized.principal.user.grade_level,
-        class_code=authorized.principal.user.class_code,
-    )
-    base_resource = _directory_resource_attrs(entry)
-    evaluator = field_evaluator or get_policy_evaluator(
-        db,
-        authorized.membership,
-        surface="directory",
-        action="contact_field_view",
-    )
-
-    def _field_allowed(field_name: str) -> bool:
-        decision = evaluator.evaluate(
-            subject=scoped_subject,
-            resource=AbacResourceAttributes(
-                department=base_resource.department,
-                grade=base_resource.grade,
-                class_code=base_resource.class_code,
-                field=field_name,
-            ),
-            default_allow_if_no_rules=True,
-        )
-        return decision.allowed
-
-    if masked:
-        return ContactResponse(
-            email=mask_email(entry.email) if _field_allowed("email") else None,
-            phone=mask_phone(entry.phone) if _field_allowed("phone") else None,
-            address_line1=mask_address(entry.address_line1) if _field_allowed("address_line1") else None,
-            masked=True,
-        )
-
-    return ContactResponse(
-        email=entry.email if _field_allowed("email") else None,
-        phone=entry.phone if _field_allowed("phone") else None,
-        address_line1=entry.address_line1 if _field_allowed("address_line1") else None,
-        masked=False,
-    )
-
-
 @router.get("/search", response_model=DirectorySearchResponse)
 def search_directory(
     q: str | None = Query(default=None, max_length=120),
@@ -206,11 +137,7 @@ def search_directory(
     availability_start = _to_utc(availability_start)
     availability_end = _to_utc(availability_end)
     overlap_clause = _availability_overlap_clause(availability_start, availability_end)
-    subject = AbacSubjectAttributes(
-        department=authorized.principal.user.department,
-        grade=authorized.principal.user.grade_level,
-        class_code=authorized.principal.user.class_code,
-    )
+    subject = build_directory_subject(authorized.principal.user)
     row_evaluator = get_policy_evaluator(db, membership, surface="directory", action="search_row")
     field_evaluator = get_policy_evaluator(db, membership, surface="directory", action="contact_field_view")
 
@@ -274,7 +201,7 @@ def search_directory(
     entries = [
         entry
         for entry in entries
-        if _is_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry)
+        if is_directory_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry)
     ]
     entry_ids = [entry.id for entry in entries]
 
@@ -292,10 +219,11 @@ def search_directory(
             tags=tags_by_entry.get(entry.id, []),
             repertoire=repertoire_by_entry.get(entry.id, []),
             availability_windows=availability_by_entry.get(entry.id, []),
-            contact=_serialize_contact_with_field_scope(
+            contact=serialize_directory_contact_with_field_scope(
                 db,
-                authorized,
-                entry,
+                membership=membership,
+                user=authorized.principal.user,
+                entry=entry,
                 masked=True,
                 subject=subject,
                 field_evaluator=field_evaluator,
@@ -304,6 +232,14 @@ def search_directory(
         )
         for entry in entries
     ]
+
+    record_directory_search_impressions(
+        db,
+        membership,
+        user_id=authorized.principal.user.id,
+        directory_entry_ids=[entry.id for entry in entries],
+    )
+    db.commit()
 
     return DirectorySearchResponse(results=results, total=len(results))
 
@@ -317,11 +253,7 @@ def get_directory_entry(
     db: Session = Depends(get_db_session),
 ) -> DirectoryEntryDetailResponse:
     membership = authorized.membership
-    subject = AbacSubjectAttributes(
-        department=authorized.principal.user.department,
-        grade=authorized.principal.user.grade_level,
-        class_code=authorized.principal.user.class_code,
-    )
+    subject = build_directory_subject(authorized.principal.user)
     row_evaluator = get_policy_evaluator(db, membership, surface="directory", action="view_row")
     field_evaluator = get_policy_evaluator(db, membership, surface="directory", action="contact_field_view")
     entry = db.scalar(
@@ -336,7 +268,7 @@ def get_directory_entry(
     if not entry:
         raise AppError(code="VALIDATION_ERROR", message="Directory entry not found in active context", status_code=404)
 
-    if not _is_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry):
+    if not is_directory_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry):
         raise AppError(code="VALIDATION_ERROR", message="Directory entry not found in active context", status_code=404)
 
     tags_by_entry = _load_tags_by_entry(db, [entry.id])
@@ -352,10 +284,11 @@ def get_directory_entry(
         tags=tags_by_entry.get(entry.id, []),
         repertoire=repertoire_by_entry.get(entry.id, []),
         availability_windows=availability_by_entry.get(entry.id, []),
-        contact=_serialize_contact_with_field_scope(
+        contact=serialize_directory_contact_with_field_scope(
             db,
-            authorized,
-            entry,
+            membership=membership,
+            user=authorized.principal.user,
+            entry=entry,
             masked=True,
             subject=subject,
             field_evaluator=field_evaluator,
@@ -378,11 +311,7 @@ def reveal_directory_contact(
     db: Session = Depends(get_db_session),
 ) -> DirectoryContactRevealResponse:
     membership = authorized.membership
-    subject = AbacSubjectAttributes(
-        department=authorized.principal.user.department,
-        grade=authorized.principal.user.grade_level,
-        class_code=authorized.principal.user.class_code,
-    )
+    subject = build_directory_subject(authorized.principal.user)
     row_evaluator = get_policy_evaluator(db, membership, surface="directory", action="reveal_row")
     field_evaluator = get_policy_evaluator(db, membership, surface="directory", action="contact_field_view")
     entry = db.scalar(
@@ -397,7 +326,7 @@ def reveal_directory_contact(
     if not entry:
         raise AppError(code="VALIDATION_ERROR", message="Directory entry not found in active context", status_code=404)
 
-    if not _is_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry):
+    if not is_directory_row_allowed(row_evaluator=row_evaluator, subject=subject, entry=entry):
         raise AppError(code="VALIDATION_ERROR", message="Directory entry not found in active context", status_code=404)
 
     db.add(
@@ -418,10 +347,11 @@ def reveal_directory_contact(
 
     return DirectoryContactRevealResponse(
         entry_id=entry.id,
-        contact=_serialize_contact_with_field_scope(
+        contact=serialize_directory_contact_with_field_scope(
             db,
-            authorized,
-            entry,
+            membership=membership,
+            user=authorized.principal.user,
+            entry=entry,
             masked=False,
             subject=subject,
             field_evaluator=field_evaluator,

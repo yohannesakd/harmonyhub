@@ -22,6 +22,7 @@ from app.imports.pipeline import (
     normalize_import_batch,
     undo_merge_action,
 )
+from app.imports.sensitive_json import reveal_import_json_payload
 from app.imports.security import MAX_UPLOAD_BYTES, validate_upload_bytes
 from app.operations.audit import record_membership_audit_event
 from app.schemas.accounts import AccountStatusResponse, FreezeAccountRequest, UnfreezeAccountRequest
@@ -97,8 +98,8 @@ def _serialize_row(row: ImportNormalizedRow) -> ImportNormalizedRowResponse:
     return ImportNormalizedRowResponse(
         id=row.id,
         row_number=row.row_number,
-        raw_row_json=row.raw_row_json,
-        normalized_json=row.normalized_json,
+        raw_row_json=reveal_import_json_payload(row.raw_row_json) or {},
+        normalized_json=reveal_import_json_payload(row.normalized_json),
         issues_json=row.issues_json,
         is_valid=row.is_valid,
         processing_status=row.processing_status,
@@ -121,7 +122,7 @@ def _serialize_duplicate(db: Session, candidate: ImportDuplicateCandidate) -> Du
         reason=candidate.reason,
         status=candidate.status,
         merge_action_id=candidate.merge_action_id,
-        normalized_json=row.normalized_json if row else None,
+        normalized_json=reveal_import_json_payload(row.normalized_json) if row else None,
         created_at=candidate.created_at,
         updated_at=candidate.updated_at,
     )
@@ -493,17 +494,17 @@ def undo_merge(
     )
 
 
-def _serialize_account_status(user: User) -> AccountStatusResponse:
+def _serialize_account_status(user: User, membership: Membership) -> AccountStatusResponse:
     return AccountStatusResponse(
         id=user.id,
         username=user.username,
         is_active=user.is_active,
-        is_frozen=bool(user.frozen_at and not user.is_active),
-        frozen_at=user.frozen_at,
-        freeze_reason=user.freeze_reason,
-        frozen_by_user_id=user.frozen_by_user_id,
-        unfrozen_at=user.unfrozen_at,
-        unfrozen_by_user_id=user.unfrozen_by_user_id,
+        is_frozen=membership.is_frozen,
+        frozen_at=membership.frozen_at,
+        freeze_reason=membership.freeze_reason,
+        frozen_by_user_id=membership.frozen_by_user_id,
+        unfrozen_at=membership.unfrozen_at,
+        unfrozen_by_user_id=membership.unfrozen_by_user_id,
     )
 
 
@@ -516,6 +517,18 @@ def _active_scope_membership_user_ids_query(membership: Membership):
     )
 
 
+def _get_scoped_membership_for_user(db: Session, scope: Membership, user_id: str) -> Membership | None:
+    return db.scalar(
+        select(Membership).where(
+            Membership.user_id == user_id,
+            Membership.organization_id == scope.organization_id,
+            Membership.program_id == scope.program_id,
+            Membership.event_id == scope.event_id,
+            Membership.store_id == scope.store_id,
+        )
+    )
+
+
 @accounts_router.get("/users", response_model=list[AccountStatusResponse])
 def list_accounts(
     authorized: AuthorizedMembership = Depends(
@@ -524,16 +537,26 @@ def list_accounts(
     db: Session = Depends(get_db_session),
 ) -> list[AccountStatusResponse]:
     membership = authorized.membership
-    users = db.scalars(
-        select(User)
+    scoped_memberships = db.scalars(
+        select(Membership)
         .where(
-            User.id.in_(
-                _active_scope_membership_user_ids_query(membership)
-            )
+            Membership.organization_id == membership.organization_id,
+            Membership.program_id == membership.program_id,
+            Membership.event_id == membership.event_id,
+            Membership.store_id == membership.store_id,
         )
-        .order_by(User.username.asc())
+        .order_by(Membership.created_at.asc())
     ).all()
-    return [_serialize_account_status(user) for user in users]
+
+    responses: list[AccountStatusResponse] = []
+    for scoped_membership in scoped_memberships:
+        user = db.scalar(select(User).where(User.id == scoped_membership.user_id))
+        if not user:
+            continue
+        responses.append(_serialize_account_status(user, scoped_membership))
+
+    responses.sort(key=lambda row: row.username)
+    return responses
 
 
 @accounts_router.post(
@@ -561,17 +584,18 @@ def freeze_account(
             ),
         )
     )
-    if not user:
+    scoped_membership = _get_scoped_membership_for_user(db, membership, user_id)
+    if not user or not scoped_membership:
         raise AppError(code="VALIDATION_ERROR", message="User not found for this active context scope", status_code=404)
 
     now = datetime.now(UTC)
-    user.is_active = False
-    user.frozen_at = now
-    user.freeze_reason = payload.reason
-    user.frozen_by_user_id = authorized.principal.user.id
-    user.unfrozen_at = None
-    user.unfrozen_by_user_id = None
-    db.add(user)
+    scoped_membership.is_frozen = True
+    scoped_membership.frozen_at = now
+    scoped_membership.freeze_reason = payload.reason
+    scoped_membership.frozen_by_user_id = authorized.principal.user.id
+    scoped_membership.unfrozen_at = None
+    scoped_membership.unfrozen_by_user_id = None
+    db.add(scoped_membership)
 
     _record_audit_event(
         db,
@@ -582,8 +606,8 @@ def freeze_account(
         details={"username": user.username, "reason": payload.reason},
     )
     db.commit()
-    db.refresh(user)
-    return _serialize_account_status(user)
+    db.refresh(scoped_membership)
+    return _serialize_account_status(user, scoped_membership)
 
 
 @accounts_router.post(
@@ -608,17 +632,18 @@ def unfreeze_account(
             ),
         )
     )
-    if not user:
+    scoped_membership = _get_scoped_membership_for_user(db, membership, user_id)
+    if not user or not scoped_membership:
         raise AppError(code="VALIDATION_ERROR", message="User not found for this active context scope", status_code=404)
 
     now = datetime.now(UTC)
-    user.is_active = True
-    user.unfrozen_at = now
-    user.unfrozen_by_user_id = authorized.principal.user.id
-    user.frozen_at = None
-    user.freeze_reason = None
-    user.frozen_by_user_id = None
-    db.add(user)
+    scoped_membership.is_frozen = False
+    scoped_membership.unfrozen_at = now
+    scoped_membership.unfrozen_by_user_id = authorized.principal.user.id
+    scoped_membership.frozen_at = None
+    scoped_membership.freeze_reason = None
+    scoped_membership.frozen_by_user_id = None
+    db.add(scoped_membership)
 
     _record_audit_event(
         db,
@@ -629,5 +654,5 @@ def unfreeze_account(
         details={"username": user.username, "reason": payload.reason},
     )
     db.commit()
-    db.refresh(user)
-    return _serialize_account_status(user)
+    db.refresh(scoped_membership)
+    return _serialize_account_status(user, scoped_membership)
